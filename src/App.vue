@@ -10,6 +10,7 @@ import SchedulingView from '@/components/SchedulingView.vue'
 import TicketView from '@/components/TicketView.vue'
 import MembersView from '@/components/MembersView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
+import GroupsView from '@/components/GroupsView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
 import ReportsView from '@/components/ReportsView.vue'
@@ -27,6 +28,7 @@ const navs = [
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'members', icon: '💎', label: '会员权益' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
+  { k: 'groups', icon: '🧑‍✈️', label: '领队组团' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
   { k: 'reports', icon: '📈', label: '经营报表' }
@@ -69,6 +71,8 @@ onMounted(store.refresh)
           <span class="halo red" v-if="store.schedulingStats.absentToday">❌ {{ store.schedulingStats.absentToday }} 人今日旷工</span>
           <span class="halo" v-if="store.schedulingStats.coverageBlocks">⛔ {{ store.schedulingStats.coverageBlocks }} 项关键岗位缺岗</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
+          <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
+          <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
         </div>
         <div class="stats">
@@ -89,6 +93,7 @@ onMounted(store.refresh)
         <TicketView v-else-if="view === 'ticket'" />
         <MembersView v-else-if="view === 'members'" />
         <ReservationsView v-else-if="view === 'reservations'" />
+        <GroupsView v-else-if="view === 'groups'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
         <ReportsView v-else />

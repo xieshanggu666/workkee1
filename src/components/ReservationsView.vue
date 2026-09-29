@@ -488,6 +488,7 @@ function pickDayIf(off) { return today.value + off }
               <span class="tag mem" v-if="r.member_id">💎 {{ r.member_code }} {{ r.member_name }}</span>
               <span class="tag fp" v-if="r.benefit_kind === 'fastpass'">⚡快速通行</span>
               <span class="tag tk" v-if="r.benefit_kind === 'ticket'">🎟️免票</span>
+              <span class="tag grp" v-if="r.source === 'group'">🧑‍✈️ 团队 {{ r.group_code }}</span>
             </div>
             <div class="meta">
               {{ r.scope === 'ride' ? `🎢 ${r.ride_name} · ` : '🏞️ ' }}
@@ -598,6 +599,7 @@ function pickDayIf(off) { return today.value + off }
 .tag.mem { color: var(--purple); border-color: rgba(167,139,250,.5); }
 .tag.fp { color: var(--blue); border-color: rgba(102,166,255,.5); }
 .tag.tk { color: var(--green); border-color: rgba(109,213,160,.5); }
+.tag.grp { color: var(--accent2); border-color: rgba(255,209,102,.5); background: rgba(255,209,102,.08); }
 
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
 .slot { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 10px; border-radius: 10px; position: relative; text-align: left; }

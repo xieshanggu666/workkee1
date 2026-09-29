@@ -47,6 +47,13 @@ function emptySchedulingStats() {
   }
 }
 
+function emptyGroupStats() {
+  return {
+    pending: 0, pendingQty: 0, activeToday: 0, activeQtyToday: 0, interrupted: 0,
+    depositToday: 0, balanceToday: 0, refundToday: 0, checkedToday: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -92,7 +99,11 @@ export const useParkStore = defineStore('park', {
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
     coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
     dispatchPlanData: s => s.data?.dispatchPlan || { days: [], params: {}, mode: 'dynamic' },
-    supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管')
+    supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管'),
+    // 领队组团
+    groups: s => s.data?.groups || [],
+    groupStats: s => s.data?.groupStats || emptyGroupStats(),
+    groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] }
   },
   actions: {
     async refresh() {
@@ -169,6 +180,18 @@ export const useParkStore = defineStore('park', {
     async scheduleLogs(payload) {
       const q = new URLSearchParams(Object.entries(payload).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, v])).toString()
       return j('GET', `/schedules/logs?${q}`)
-    }
+    },
+    // 领队组团
+    submitGroup(payload) { return this.api('POST', '/groups', payload) },
+    confirmGroup(id, request_id) { return this.api('POST', `/groups/${id}/confirm`, { request_id }) },
+    rejectGroup(id, payload) { return this.api('POST', `/groups/${id}/reject`, payload) },
+    cancelGroup(id, request_id) { return this.api('POST', `/groups/${id}/cancel`, { request_id }) },
+    payGroupBalance(id, amount, request_id) { return this.api('POST', `/groups/${id}/balance`, { amount, request_id }) },
+    checkinGroupItem(id, qty, request_id) { return this.api('POST', `/group-items/${id}/checkin`, { qty, request_id }) },
+    refundGroupLeg(id, qty, request_id) { return this.api('POST', `/group-items/${id}/refund`, { qty, request_id }) },
+    rerouteGroupItem(id, slot_id, request_id) { return this.api('POST', `/group-items/${id}/reroute`, { slot_id, request_id }) },
+    refundOutageItem(id, request_id) { return this.api('POST', `/group-items/${id}/refund-outage`, { request_id }) },
+    saveGroupConfig(payload) { return this.api('POST', '/group-config', payload) },
+    async groupDetail(id) { return j('GET', `/groups/${id}`) }
   }
 })

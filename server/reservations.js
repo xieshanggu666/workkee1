@@ -78,6 +78,8 @@ const ctx = {
   ticket: () => num(getSetting('ticket'), 120),
   logFinance: null,
   createComplaint: null,
+  // 领队组团联动：设施停运/时段关闭时，source='group' 的在途预约交团模块重排或退款（同事务）
+  handleParkOutageGroup: null,
   // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
   quoteReservation: null,
   onReservationBooked: null,
@@ -141,11 +143,18 @@ export function syncRideSlots(ride) {
     // 关闭/检修：关停全部时段（含历史，恢复运营时再统一开放）；在途预约园方全额退款
     db.prepare(`UPDATE reservation_slots SET status='closed' WHERE scope='ride' AND ride_id=?`)
       .run(ride.id)
+    const pendingAll = db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
+                  AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour())
+    // 领队团预约（0 元团单，款项在团账）：交团模块同事务重排行程或全额回退团账（不自建投诉，避免重复）
+    const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
+    const guestRows = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
+    if (groupRows.length && ctx.handleParkOutageGroup) {
+      ctx.handleParkOutageGroup(groupRows, { type: 'ride', ride: { id: ride.id, name: ride.name }, reason: ride.status === 'maintenance' ? 'maintenance' : 'closed' })
+    }
     forceRefundByPark(
-      db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
-                  AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour()),
+      guestRows,
       `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
-      { title: `设施故障 · ${ride.name}` }
+      { title: `设施故障 · ${ride.name}`, skipComplaint: groupRows.length > 0 }
     )
     return { ok: true }
   })
@@ -421,7 +430,9 @@ function applyCheckin(rsv, slot, source) {
 // 返回 { entry: 实际入园人数, ride: Map<rideId, 游玩人数>, displaced: 被安置/退款人数, errors: 失败单数 }
 export function autoCheckin(hour) {
   const day = ctx.day()
-  const due = db.prepare("SELECT * FROM reservations WHERE status='booked' AND slot_day=? AND slot_hour=?").all(day, hour)
+  // source='group' 的团预约由领队组团模块统一分批/自动核销（款项与团账联动），散客引擎不处理
+  const due = db.prepare(`SELECT * FROM reservations WHERE status='booked' AND slot_day=? AND slot_hour=?
+                          AND (source IS NULL OR source<>'group' OR group_item_id IS NULL)`).all(day, hour)
   const entryArrivals = { qty: 0 }
   const rideArrivals = new Map()
   let displaced = 0
@@ -481,8 +492,10 @@ function findAlternativeSlot(rsv) {
 // 整批一个事务；状态条件更新保证与退款/核销并发时不会重复没收
 export function expireNoShow(hour) {
   const day = ctx.day()
+  // 领队团预约由组团模块统一核销（款项走团账），散客爽约批处理不触达
   const due = db.prepare(`SELECT * FROM reservations WHERE status='booked'
-                          AND (slot_day<? OR (slot_day=? AND slot_hour<?))`).all(day, day, hour)
+                          AND (slot_day<? OR (slot_day=? AND slot_hour<?))
+                          AND (source IS NULL OR source<>'group' OR group_item_id IS NULL)`).all(day, day, hour)
   let qty = 0
   runAtomic(() => {
     for (const rsv of due) {
@@ -596,11 +609,22 @@ export function updateSlot(id, patch) {
   return runAtomic(() => {
     if (patch.status === 'closed') {
       // 关闭时段：在途预约园方全额退款并生成投诉
-      const pending = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
+      const pendingAll = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
+      // 领队团预约交团模块处理（重排 / 回退团账），其余园方全额退款
+      const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
+      const pending = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
+      if (groupRows.length && ctx.handleParkOutageGroup) {
+        const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
+        ctx.handleParkOutageGroup(groupRows, {
+          type: s.scope,
+          ride: ride || null,
+          reason: 'slot_closed'
+        })
+      }
       if (pending.length) {
         const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
         forceRefundByPark(pending, `运营关闭 ${s.day}日 ${s.hour}:00 时段，园方强制退款`,
-          { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service' })
+          { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service', skipComplaint: groupRows.length > 0 })
       }
     }
     vals.push(id)
@@ -609,7 +633,7 @@ export function updateSlot(id, patch) {
   })
 }
 
-export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null } = {}) {
+export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null, includeGroup = false } = {}) {
   const rides = allRideLite()
   const conds = []
   const vals = []
@@ -617,10 +641,18 @@ export function listReservations({ status = null, scope = null, day = null, limi
   if (scope) { conds.push('scope=?'); vals.push(scope) }
   if (day) { conds.push('slot_day=?'); vals.push(num(day)) }
   if (memberId) { conds.push('member_id=?'); vals.push(num(memberId)) }
+  // 团预约（source='group'）由团队模块页面管理，默认不在散客核销列表中出现
+  if (!includeGroup) conds.push("(source IS NULL OR source<>'group' OR group_item_id IS NULL)")
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const rows = db.prepare(`SELECT * FROM reservations ${where} ORDER BY id DESC LIMIT ?`).all(...vals, num(limit, 120))
   const memberRows = db.prepare('SELECT id,code,name,card_tier FROM members').all()
   const memberMap = new Map(memberRows.map(m => [m.id, m]))
+  const groupRows = db.prepare('SELECT id,code FROM group_orders').all()
+  const groupMap = new Map()
+  if (groupRows.length) {
+    db.prepare('SELECT gi.id, g.code, g.leader_name FROM group_items gi JOIN group_orders g ON g.id=gi.group_id').all()
+      .forEach(x => groupMap.set(x.id, x))
+  }
   return rows.map(r => ({
     ...r,
     ride_name: r.ride_id ? (rides.find(x => x.id === r.ride_id)?.name || `设施#${r.ride_id}`) : '',
@@ -628,6 +660,8 @@ export function listReservations({ status = null, scope = null, day = null, limi
     status_name: STATUS_NAMES[r.status] || r.status,
     member_code: r.member_id ? (memberMap.get(r.member_id)?.code || '') : '',
     member_name: r.member_id ? (memberMap.get(r.member_id)?.name || '') : '',
+    group_code: r.group_item_id ? (groupMap.get(r.group_item_id)?.code || '') : '',
+    group_leader: r.group_item_id ? (groupMap.get(r.group_item_id)?.leader_name || '') : '',
     benefit_kind: r.benefit_id
       ? (db.prepare('SELECT kind FROM member_benefits WHERE id=?').get(r.benefit_id)?.kind || '')
       : ''
@@ -728,4 +762,36 @@ export function reservationStats() {
   }
 }
 
-export const RESERVATION_CONST = { OPEN_HOUR, ENTRY_HOURS, RIDE_HOURS, GENERATE_DAYS }
+export const RESERVATION_CONST = { OPEN_HOUR, ENTRY_HOURS, RIDE_HOURS, GENERATE_DAYS, DEFAULT_ENTRY_CAP, DEFAULT_RIDE_CAP }
+
+// 领队组团模块复用：时段行查询（含余量）
+export function getSlotById(id) { return getSlot(num(id)) }
+export function findEntrySlot(day, hour) {
+  return db.prepare(`${SLOT_SELECT} WHERE s.scope='entry' AND s.day=? AND s.hour=?`).get(day, hour)
+}
+export function findRideSlot(rideId, day, hour) {
+  return db.prepare(`${SLOT_SELECT} WHERE s.scope='ride' AND s.ride_id=? AND s.day=? AND s.hour=?`).get(rideId, day, hour)
+}
+// 团行程重排候选：相对「原时段」之后的同类开放时段，真实容量可容纳 remain 人。
+// 入园：不跨设施，可改同日更晚或之后日期；设施：优先同日更晚的其他开放设施（不擅自改日）。
+// excludeRideId 传 null 时允许选回同一设施（领队手动改点）；停运自动重排则排除停运设施本身。
+export function findGroupAltSlots({ kind, rideId = null, excludeRideId = null, day, hour, qty }) {
+  if (kind === 'entry') {
+    return db.prepare(`${SLOT_SELECT} WHERE s.scope='entry' AND s.status='open'
+        AND (s.day>? OR (s.day=? AND s.hour>?))
+        AND s.capacity+s.oversell-s.booked_count>=?
+        ORDER BY s.day, s.hour LIMIT 8`).all(day, day, hour, qty)
+  }
+  const ex = excludeRideId === null ? null : num(excludeRideId)
+  if (ex === null) {
+    return db.prepare(`${SLOT_SELECT} WHERE s.scope='ride' AND s.status='open'
+        AND s.day=? AND s.hour>?
+        AND s.capacity+s.oversell-s.booked_count>=?
+        ORDER BY s.hour LIMIT 12`).all(day, hour, qty)
+  }
+  return db.prepare(`${SLOT_SELECT} WHERE s.scope='ride' AND s.status='open'
+      AND s.ride_id<>?
+      AND s.day=? AND s.hour>?
+      AND s.capacity+s.oversell-s.booked_count>=?
+      ORDER BY s.hour LIMIT 8`).all(ex, day, hour, qty)
+}

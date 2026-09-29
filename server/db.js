@@ -482,6 +482,95 @@ CREATE TABLE IF NOT EXISTS shift_logs (
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_sched ON shift_logs(schedule_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_att ON shift_logs(attendance_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_req ON shift_logs(request_id);
+
+-- ---------------- 领队组团：入园 + 多设施行程团队预约 ----------------
+-- 团单：领队提交（pending）→ 运营确认锁定名额并收订金（confirmed）→ 分批核销/尾款结算 → 完成/爽约结案/取消
+CREATE TABLE IF NOT EXISTS group_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',            -- 团号 TU0001
+  leader_name TEXT NOT NULL,                -- 领队姓名
+  leader_phone TEXT NOT NULL DEFAULT '',
+  qty INTEGER NOT NULL,                     -- 团队总人数
+  visit_day INTEGER NOT NULL,               -- 入园游戏日
+  entry_hour INTEGER NOT NULL,              -- 入园时段
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending/confirmed/settled/completed/cancelled/rejected/closed_noshow
+  total_amount INTEGER NOT NULL DEFAULT 0,      -- 应收原额（提交时按牌价核定）
+  receivable_amount INTEGER NOT NULL DEFAULT 0, -- 当前应收（部分退团/园方退一程逐额冲减）
+  deposit_rate REAL NOT NULL DEFAULT 0.3,       -- 订金比例
+  deposit_amount INTEGER NOT NULL DEFAULT 0,    -- 已收订金
+  paid_balance INTEGER NOT NULL DEFAULT 0,      -- 已收尾款（可分批）
+  refunded_amount INTEGER NOT NULL DEFAULT 0,   -- 已现金退还领队金额
+  fee_amount INTEGER NOT NULL DEFAULT 0,        -- 没收/手续费累计（爽约、当日退团）
+  source TEXT NOT NULL DEFAULT 'leader',        -- leader 领队端 / auto 模拟团
+  note TEXT NOT NULL DEFAULT '',
+  created_tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  confirm_tick INTEGER NOT NULL DEFAULT 0,
+  closed_tick INTEGER NOT NULL DEFAULT 0,
+  closed_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_groups_status ON group_orders(status);
+CREATE INDEX IF NOT EXISTS idx_groups_day ON group_orders(visit_day);
+
+-- 团行程明细：1 条入园 + N 条设施；锁定后一一对应 source='group' 的预约单（0 元，款项走团账）
+CREATE TABLE IF NOT EXISTS group_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                       -- entry 入园 / ride 设施
+  ride_id INTEGER,                          -- entry 为 NULL
+  slot_id INTEGER,                          -- 锁定后关联的分时库存
+  slot_day INTEGER NOT NULL,
+  slot_hour INTEGER NOT NULL,
+  qty INTEGER NOT NULL,                     -- 该程总人数
+  unit_price INTEGER NOT NULL DEFAULT 0,   -- 单人牌价（提交时快照）
+  amount INTEGER NOT NULL DEFAULT 0,       -- 该程应收 = qty*unit_price
+  checked_qty INTEGER NOT NULL DEFAULT 0,  -- 已分批核销人数
+  refunded_qty INTEGER NOT NULL DEFAULT 0, -- 已退团/停运退款人数
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending/active/interrupted/rerouted/refund_park/refund_guest/noshow/checked
+  reservation_id INTEGER,                  -- 关联 reservations.id（重排停运时可能换单）
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gitems_group ON group_items(group_id);
+CREATE INDEX IF NOT EXISTS idx_gitems_status ON group_items(status);
+
+-- 团账务流水：订金/尾款/退款/没收逐笔留痕，供财务对账
+CREATE TABLE IF NOT EXISTS group_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                       -- deposit/balance/refund_park/refund_guest/fee/noshow
+  amount INTEGER NOT NULL,                  -- 正=向领队收款，负=退还给领队（fee/noshow 为没收收入，记正）
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gpay_group ON group_payments(group_id);
+
+-- 分批核销批次（闸机/设施口逐批放行，每批一条）
+CREATE TABLE IF NOT EXISTS group_checkins (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  item_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual',    -- manual 人工 / auto 引擎自动
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_gcheckin_group ON group_checkins(group_id);
+
+-- 团生命周期时间线（提交/确认/收订金/核销批次/退团/重排/停运/退款/爽约结案）
+CREATE TABLE IF NOT EXISTS group_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_glog_group ON group_logs(group_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -500,6 +589,8 @@ ensureColumn('complaints', 'member_id', "member_id INTEGER")
 // 动态调度：排班/申请来源（manual/auto/dispatch；staff/dispatch）
 ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'")
 ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
+// 领队组团：source='group' 的预约单关联团行程明细 id（款项走团账，该预约 amount 恒为 0）
+ensureColumn('reservations', 'group_item_id', "group_item_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -655,6 +746,8 @@ function seed() {
   setIf('dispatchGuardFlow', 500)         // 每名保安班段可承载的预约预测客流
   setIf('dispatchCleanFlow', 700)         // 每名保洁班段可承载的预约预测客流
   setIf('dispatchNightGuardsPerZone', 0)  // 夜勤保安区域配比（0=不强制）
+  setIf('groupDepositRate', 0.3)          // 团队订金比例（运营确认时锁定名额并收取）
+  setIf('groupEnabled', 1)                // 领队组团模块开关
 
   // 示例会员（新库首日建立；含一名金卡会员便于演示等级与权益流转）
   if (db.prepare('SELECT COUNT(*) n FROM members').get().n === 0) {
@@ -720,7 +813,9 @@ function ensureScheduleBaseData() {
     // 动态调度参数：每个保安/保洁可承载的预约预测客流（人/班段）；夜班每个开放区域保安数
     ['dispatchGuardFlow', 500],
     ['dispatchCleanFlow', 700],
-    ['dispatchNightGuardsPerZone', 0]  // 0=夜班不强制（按需动态补）；>0 时每 N 个区域至少 1 名夜勤保安
+    ['dispatchNightGuardsPerZone', 0],  // 0=夜班不强制（按需动态补）；>0 时每 N 个区域至少 1 名夜勤保安
+    ['groupDepositRate', 0.3],          // 团队订金比例
+    ['groupEnabled', 1]                 // 领队组团模块开关
   ]) {
     if (!getSetting(k)) setSetting(k, String(v))
   }
