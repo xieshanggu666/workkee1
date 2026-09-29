@@ -47,6 +47,13 @@ function emptySchedulingStats() {
   }
 }
 
+function emptyGroupStats() {
+  return {
+    pending: 0, pendingQty: 0, active: 0, activeQty: 0, todayGroups: 0,
+    depositHeld: 0, outstanding: 0, refundToday: 0, settledToday: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -92,7 +99,10 @@ export const useParkStore = defineStore('park', {
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
     coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
     dispatchPlanData: s => s.data?.dispatchPlan || { days: [], params: {}, mode: 'dynamic' },
-    supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管')
+    supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管'),
+    // 领队团队行程
+    groups: s => s.data?.groups || [],
+    groupStats: s => s.data?.groupStats || emptyGroupStats()
   },
   actions: {
     async refresh() {
@@ -169,6 +179,16 @@ export const useParkStore = defineStore('park', {
     async scheduleLogs(payload) {
       const q = new URLSearchParams(Object.entries(payload).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, v])).toString()
       return j('GET', `/schedules/logs?${q}`)
-    }
+    },
+    // 领队团队行程（写操作携带 request_id 幂等键）
+    submitGroup(payload) { return this.api('POST', '/groups', payload) },
+    confirmGroup(id, request_id) { return this.api('POST', `/groups/${id}/confirm`, { request_id }) },
+    rejectGroup(id, reason, request_id) { return this.api('POST', `/groups/${id}/reject`, { reason, request_id }) },
+    checkinGroup(id, payload) { return this.api('POST', `/groups/${id}/checkin`, payload) },
+    settleGroup(id, payload) { return this.api('POST', `/groups/${id}/settle`, payload || {}) },
+    refundGroup(id, qty, request_id) { return this.api('POST', `/groups/${id}/refund`, { qty, request_id }) },
+    cancelGroup(id, request_id) { return this.api('POST', `/groups/${id}/cancel`, { request_id }) },
+    rerouteGroupLeg(id, legId, slot_id, request_id) { return this.api('POST', `/groups/${id}/legs/${legId}/reroute`, { slot_id, request_id }) },
+    async groupDetail(id) { return j('GET', `/groups/${id}`) }
   }
 })

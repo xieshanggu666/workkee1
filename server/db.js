@@ -482,6 +482,69 @@ CREATE TABLE IF NOT EXISTS shift_logs (
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_sched ON shift_logs(schedule_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_att ON shift_logs(attendance_id);
 CREATE INDEX IF NOT EXISTS idx_shiftlogs_req ON shift_logs(request_id);
+
+-- ---------------- 领队团队行程（入园 + 多设施打包行程） ----------------
+-- 领队提交行程 → 运营确认（锁定各时段名额并收订金）→ 分批核销入园与设施 → 尾款结算 → 部分退团 / 设施停运重排退款
+CREATE TABLE IF NOT EXISTS group_bookings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',        -- 团号 TD0001
+  leader_name TEXT NOT NULL,
+  leader_phone TEXT NOT NULL DEFAULT '',
+  org TEXT NOT NULL DEFAULT '',         -- 组团单位（旅行社/企业/学校）
+  visit_day INTEGER NOT NULL,           -- 入园游戏日（整个团按单日行程）
+  headcount INTEGER NOT NULL,           -- 成团人数
+  total_amount INTEGER NOT NULL DEFAULT 0,  -- 行程原价合计（票价口径，用于对账）
+  cancelled_amount INTEGER NOT NULL DEFAULT 0, -- 已核销行程价值（已核销 + 已退/已取消腿价）
+  fee_amount INTEGER NOT NULL DEFAULT 0,    -- 退团/爽约留存款（手续费/违约没收）
+  paid_amount INTEGER NOT NULL DEFAULT 0,   -- 已实际收款（订金 + 尾款）
+  refund_amount INTEGER NOT NULL DEFAULT 0, -- 已实际退回现金
+  deposit_rate INTEGER NOT NULL DEFAULT 30, -- 订金比例（%）
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending 待确认 / confirmed 已确认锁定 / active 入园中 / settled 已结清 / cancelled 已取消
+  reject_reason TEXT NOT NULL DEFAULT '',
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0,
+  confirmed_tick INTEGER NOT NULL DEFAULT 0,
+  closed_tick INTEGER NOT NULL DEFAULT 0,
+  closed_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_groups_status ON group_bookings(status);
+CREATE INDEX IF NOT EXISTS idx_groups_day ON group_bookings(visit_day);
+
+-- 团队行程腿：一条入园腿 + N 条设施腿；确认时各生成一张 team 预约单占用分时名额
+CREATE TABLE IF NOT EXISTS group_legs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,        -- 行程顺序
+  scope TEXT NOT NULL,                   -- entry / ride
+  ride_id INTEGER,
+  reservation_id INTEGER,                -- 在途锚点预约单（split/refund 后会迁移）
+  slot_day INTEGER NOT NULL,
+  slot_hour INTEGER NOT NULL,
+  unit_price INTEGER NOT NULL DEFAULT 0, -- 单人单价（提交时按牌价快照）
+  qty INTEGER NOT NULL,                  -- 当前在途人数（核销/部分退后减少）
+  original_qty INTEGER NOT NULL,         -- 原始排定人数
+  checked_qty INTEGER NOT NULL DEFAULT 0,  -- 已核销人数
+  refunded_qty INTEGER NOT NULL DEFAULT 0, -- 已退团/取消人数
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/locked/checked/noshow/refunded/routed
+  reschedules INTEGER NOT NULL DEFAULT 0,
+  refund_amount INTEGER NOT NULL DEFAULT 0, -- 该腿累计退回现金
+  fee_amount INTEGER NOT NULL DEFAULT 0,    -- 该腿累计留存款
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_glegs_group ON group_legs(group_id);
+CREATE INDEX IF NOT EXISTS idx_glegs_rsv ON group_legs(reservation_id);
+
+-- 团队生命周期时间线（提交/确认/拒绝/核销/退团/重排/退款/结清/取消/爽约）
+CREATE TABLE IF NOT EXISTS group_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_glogs_group ON group_logs(group_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -500,6 +563,10 @@ ensureColumn('complaints', 'member_id', "member_id INTEGER")
 // 动态调度：排班/申请来源（manual/auto/dispatch；staff/dispatch）
 ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'")
 ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
+// 团队行程：预约单归属团（team 来源锚点单，仅占用分时名额，金额/核销/退款由团队模块自管）
+ensureColumn('reservations', 'group_id', "group_id INTEGER")
+ensureColumn('group_legs', 'checked_qty', "checked_qty INTEGER NOT NULL DEFAULT 0")
+ensureColumn('group_legs', 'refunded_qty', "refunded_qty INTEGER NOT NULL DEFAULT 0")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。

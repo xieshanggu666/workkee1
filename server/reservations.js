@@ -31,6 +31,14 @@ export const RSV_ERR = {
 
 const fail = (code, msg, extra = {}) => ({ ok: false, code, msg, ...extra })
 
+// 团队锚点单（source='team'）由团队行程模块统一核销/退款/改期，散客预约接口一律拒绝
+function rejectTeamAnchor(rsv) {
+  if (rsv && rsv.source === 'team') {
+    return fail(RSV_ERR.STATUS_CONFLICT, '该名额属于团队行程，请在「团队行程」页按团操作（分批核销/退团/改期）')
+  }
+  return null
+}
+
 // 事务内抛出的业务错误：触发整体回滚，由 runAtomic 转换为可追踪的失败响应
 class TxError extends Error {
   constructor(code, msg, extra = {}) { super(msg); this.code = code; this.extra = extra }
@@ -81,7 +89,10 @@ const ctx = {
   // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
   quoteReservation: null,
   onReservationBooked: null,
-  onReservationRefunded: null
+  onReservationRefunded: null,
+  // 团队行程联动：设施停运（先于散客退款执行，可同设施改期则改期否则园方全额退款）、时段关闭（先改期后退款）
+  onGroupRideDown: null,
+  onGroupSlotClosed: null
 }
 export function initReservationContext(deps) {
   Object.assign(ctx, deps)
@@ -139,10 +150,15 @@ export function syncRideSlots(ride) {
       return { ok: true }
     }
     // 关闭/检修：关停全部时段（含历史，恢复运营时再统一开放）；在途预约园方全额退款
+    // 团队行程先联动（可同设施改期则改期，整体停运可跨设施改排，无法安置再园方退款），再关停散客时段
+    if (ride.status !== 'operating' && ctx.onGroupRideDown) {
+      ctx.onGroupRideDown(ride)
+    }
     db.prepare(`UPDATE reservation_slots SET status='closed' WHERE scope='ride' AND ride_id=?`)
       .run(ride.id)
     forceRefundByPark(
       db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
+                  AND (source IS NULL OR source<>'team')
                   AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour()),
       `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
       { title: `设施故障 · ${ride.name}` }
@@ -302,6 +318,7 @@ export function cancelReservation(id, requestId = '') {
   return idempotent('cancel', requestId, () => {
     const rsv = getReservation(id)
     if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    const guard1 = rejectTeamAnchor(rsv); if (guard1) return guard1
     if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可取消（可能已核销/退款/爽约）')
     if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour <= ctx.hour())) {
       return fail(RSV_ERR.SLOT_PAST, '入园时段已开始/结束，不可取消；未到场将按爽约处理')
@@ -317,6 +334,7 @@ export function rescheduleReservation(id, targetSlotId, requestId = '') {
   return idempotent('reschedule', requestId, () => {
     const rsv = getReservation(id)
     if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    const guard2 = rejectTeamAnchor(rsv); if (guard2) return guard2
     if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可改签')
     if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour < ctx.hour())) {
       return fail(RSV_ERR.SLOT_PAST, '原时段已过期，不可改签')
@@ -375,6 +393,7 @@ export function checkinReservation(id, requestId = '') {
   return idempotent('checkin', requestId, () => {
     const rsv = getReservation(id)
     if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    const guard = rejectTeamAnchor(rsv); if (guard) return guard
     if (rsv.status === 'checked') return fail(RSV_ERR.STATUS_CONFLICT, '该预约已核销，请勿重复扫码')
     if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可核销（可能已退款/爽约）')
     // 未到入园时段不可提前核销
@@ -421,7 +440,8 @@ function applyCheckin(rsv, slot, source) {
 // 返回 { entry: 实际入园人数, ride: Map<rideId, 游玩人数>, displaced: 被安置/退款人数, errors: 失败单数 }
 export function autoCheckin(hour) {
   const day = ctx.day()
-  const due = db.prepare("SELECT * FROM reservations WHERE status='booked' AND slot_day=? AND slot_hour=?").all(day, hour)
+  // team 锚点单由团队模块 autoProcessGroupArrivals 统一分批核销，散客引擎跳过
+  const due = db.prepare("SELECT * FROM reservations WHERE status='booked' AND slot_day=? AND slot_hour=? AND (source IS NULL OR source<>'team')").all(day, hour)
   const entryArrivals = { qty: 0 }
   const rideArrivals = new Map()
   let displaced = 0
@@ -481,7 +501,8 @@ function findAlternativeSlot(rsv) {
 // 整批一个事务；状态条件更新保证与退款/核销并发时不会重复没收
 export function expireNoShow(hour) {
   const day = ctx.day()
-  const due = db.prepare(`SELECT * FROM reservations WHERE status='booked'
+  // team 锚点单由团队模块 dayCloseGroups 日结爽约（订金/尾款口径独立），此处跳过
+  const due = db.prepare(`SELECT * FROM reservations WHERE status='booked' AND (source IS NULL OR source<>'team')
                           AND (slot_day<? OR (slot_day=? AND slot_hour<?))`).all(day, day, hour)
   let qty = 0
   runAtomic(() => {
@@ -595,8 +616,10 @@ export function updateSlot(id, patch) {
 
   return runAtomic(() => {
     if (patch.status === 'closed') {
-      // 关闭时段：在途预约园方全额退款并生成投诉
-      const pending = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
+      // 关闭时段：团队行程先联动（团内命中腿优先自动改期，无法安置再园方全额退款），再处理散客退款
+      if (ctx.onGroupSlotClosed) ctx.onGroupSlotClosed(s)
+      // 散客在途预约园方全额退款并生成投诉
+      const pending = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked' AND (source IS NULL OR source<>'team')").all(id)
       if (pending.length) {
         const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
         forceRefundByPark(pending, `运营关闭 ${s.day}日 ${s.hour}:00 时段，园方强制退款`,
@@ -609,7 +632,7 @@ export function updateSlot(id, patch) {
   })
 }
 
-export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null } = {}) {
+export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null, includeTeams = false } = {}) {
   const rides = allRideLite()
   const conds = []
   const vals = []
@@ -617,6 +640,7 @@ export function listReservations({ status = null, scope = null, day = null, limi
   if (scope) { conds.push('scope=?'); vals.push(scope) }
   if (day) { conds.push('slot_day=?'); vals.push(num(day)) }
   if (memberId) { conds.push('member_id=?'); vals.push(num(memberId)) }
+  if (!includeTeams) conds.push("(source IS NULL OR source<>'team')")
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const rows = db.prepare(`SELECT * FROM reservations ${where} ORDER BY id DESC LIMIT ?`).all(...vals, num(limit, 120))
   const memberRows = db.prepare('SELECT id,code,name,card_tier FROM members').all()
@@ -694,16 +718,17 @@ export function reservationStats() {
       COALESCE(SUM(noshow_count),0) AS noshow,
       COALESCE(SUM(refund_count),0) AS refund
     FROM reservation_slots WHERE day=? AND scope='entry'`).get(day)
-  const pending = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(qty),0) q FROM reservations WHERE status='booked' AND slot_day>=?").get(day)
-  const noshowToday = one("SELECT COUNT(*) n FROM reservations WHERE status='noshow' AND closed_day=?").n
-  const refundToday = one("SELECT COUNT(*) n, COALESCE(SUM(amount),0) a FROM reservations WHERE status IN ('refunded','refunded_half') AND closed_day=?")
+  // 以下单据口径统计均排除团队锚点单（team 单金额恒 0、款项由团队模块记账）
+  const pending = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(qty),0) q FROM reservations WHERE status='booked' AND slot_day>=? AND (source IS NULL OR source<>'team')").get(day)
+  const noshowToday = one("SELECT COUNT(*) n FROM reservations WHERE status='noshow' AND closed_day=? AND (source IS NULL OR source<>'team')").n
+  const refundToday = one("SELECT COUNT(*) n, COALESCE(SUM(amount),0) a FROM reservations WHERE status IN ('refunded','refunded_half') AND closed_day=? AND (source IS NULL OR source<>'team')")
   const checkedToday = one("SELECT COALESCE(SUM(qty),0) q FROM reservations WHERE status='checked' AND scope='entry' AND slot_day=?").q
-  const refundedToday = one("SELECT COALESCE(SUM(qty),0) q FROM reservations WHERE status='refunded' AND slot_day=?").q
-  const soldAhead = db.prepare("SELECT COALESCE(SUM(qty),0) q, COALESCE(SUM(amount),0) a FROM reservations WHERE status='booked' AND slot_day>?").get(day)
-  // 超售待处理：落在超售名额内（预约量超过时段真实容量）的在途预约单数
+  const refundedToday = one("SELECT COALESCE(SUM(qty),0) q FROM reservations WHERE status='refunded' AND slot_day=? AND (source IS NULL OR source<>'team')").q
+  const soldAhead = db.prepare("SELECT COALESCE(SUM(qty),0) q, COALESCE(SUM(amount),0) a FROM reservations WHERE status='booked' AND slot_day>? AND (source IS NULL OR source<>'team')").get(day)
+  // 超售待处理：落在超售名额内（预约量超过时段真实容量）的在途散客预约单数
   const oversoldPending = db.prepare(`SELECT COUNT(*) n FROM reservations r
     JOIN reservation_slots s ON s.id=r.slot_id
-    WHERE r.status='booked' AND r.slot_day>=? AND s.booked_count > s.capacity`).get(day).n
+    WHERE r.status='booked' AND r.slot_day>=? AND s.booked_count > s.capacity AND (r.source IS NULL OR r.source<>'team')`).get(day).n
   // 未来各日预约概况（容量日历）
   const calendar = db.prepare(`SELECT day, scope,
       COALESCE(SUM(capacity+oversell),0) AS cap,

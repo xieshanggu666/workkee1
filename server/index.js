@@ -30,6 +30,13 @@ import {
   shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
   listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter
 } from './scheduling.js'
+import {
+  initGroupContext, submitGroup, confirmGroup, rejectGroup,
+  checkinGroupLeg, settleGroupBalance, partialRefund, cancelGroup,
+  rerouteGroupLeg, autoProcessGroupArrivals, dayCloseGroups,
+  parkRefundRideGroups, handleGroupSlotClosed,
+  listGroups, groupDetail, groupStats
+} from './groups.js'
 
 const app = express()
 app.use(express.json())
@@ -110,6 +117,17 @@ initReservationContext({
   onReservationRefunded: (...args) => onReservationRefunded(...args)
 })
 bindReservationAutoBook((slot, payload) => autoBookMember(slot, payload))
+
+// 领队团队行程模块共享：时钟 / 现金 / 财务流水 / 投诉建单
+initGroupContext({
+  logFinance,
+  createComplaint: (payload) => createComplaint(payload)
+})
+// 预约时段关停联动团队行程：设施停运优先跨设施重排、单时段关闭优先同设施改期，无法安置园方退款
+initReservationContext({
+  onGroupRideDown: (ride) => parkRefundRideGroups(ride),
+  onGroupSlotClosed: (slot) => handleGroupSlotClosed(slot)
+})
 
 // ---------------- 分期贷款 ----------------
 const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
@@ -562,6 +580,13 @@ function tick() {
         .run(state.tick(), day, 'member', '会员卡集中到期',
           `日结扫描发现 ${expiredCards} 张会员卡已过有效期，已自动降级为普通会员（积分与储值余额保留）。会员专员可跟进续费转化。`, 0, 'resolved')
     }
+    // 团队行程闭园日结：当日未核销项目按爽约结清（订金/已付款不退、尾款不补收），未入园团整团撤单
+    const grpClose = dayCloseGroups(day)
+    if (grpClose.groups > 0) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'member', '团队行程日结',
+          `闭园日结处理 ${grpClose.groups} 个团队（${grpClose.legs} 项未核销行程按爽约结清）。`, 0, 'resolved')
+    }
     day += 1
     setSetting('day', day)
   }
@@ -577,6 +602,10 @@ function tick() {
     const arrival = autoCheckin(hour)
     reservedEntry = arrival.entry
     arrival.ride.forEach((qty, rid) => reservedRiders.set(rid, qty))
+    // 团队行程当小时项目整建制自动核销（入园腿核销同时收齐尾款），分批核销由闸机人工操作
+    const grpArrival = autoProcessGroupArrivals(hour)
+    reservedEntry += grpArrival.entry
+    grpArrival.ride.forEach((qty, rid) => reservedRiders.set(rid, (reservedRiders.get(rid) || 0) + qty))
   }
 
   // 入园人数模型（散客侧：预约到场已计入实际客流，不再重复收取门票）
@@ -830,6 +859,9 @@ app.get('/api/state', (req, res) => {
     reservationStats: reservationStats(),
     entrySlots: listSlots({ scope: 'entry' }),
     reservations: listReservations({ limit: 100 }),
+    // 领队团队行程（入园 + 多设施打包行程的确认/核销/尾款/退团/改排闭环）
+    groupStats: groupStats(),
+    groups: listGroups({ limit: 100 }),
     // 会员与权益中心
     memberConfig: getConfig(),
     memberStats: memberStats(),
@@ -948,14 +980,27 @@ app.post('/api/rides/:id', (req, res) => {
 
 app.delete('/api/rides/:id', (req, res) => {
   const id = num(req.params.id)
-  // 拆除前对在途预约按园方原因全额退款
-  const pending = db.prepare("SELECT * FROM reservations WHERE ride_id=? AND status='booked'").all(id)
-  for (const r of pending) {
-    refundReservation(r, 'park', '设施拆除，园方强制退款')
+  // 拆除前先联动团队行程：停运退款/跨设施改排在同一事务内完成
+  const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
+  try {
+    tx(() => {
+      if (ride) {
+        parkRefundRideGroups({ ...ride, status: 'closed' })
+        // 散客在途预约按园方原因全额退款
+        const pending = db.prepare("SELECT * FROM reservations WHERE ride_id=? AND status='booked' AND (source IS NULL OR source<>'team')").all(id)
+        for (const r of pending) {
+          // 在事务内直接走退款核心（逐单容错：一单失败回滚整批）
+          refundReservation(r, 'park', '设施拆除，园方强制退款')
+        }
+      }
+      // 在途检修工单作废
+      cancelOrdersByRide(id)
+      db.prepare('DELETE FROM rides WHERE id=?').run(id)
+    })
+  } catch (e) {
+    console.error(`[rides] 设施 #${id} 拆除联动失败，已整体回滚 [${req.reqId}]:`, e)
+    return res.status(500).json({ ok: false, code: 'TX_FAILED', msg: '拆除联动失败，本次操作未生效，请稍后重试', reqId: req.reqId })
   }
-  // 在途检修工单作废
-  cancelOrdersByRide(id)
-  db.prepare('DELETE FROM rides WHERE id=?').run(id)
   res.json({ ok: true })
 })
 
@@ -1486,6 +1531,82 @@ app.get('/api/reservations/:id', (req, res) => {
   const list = listReservations({ limit: 5000 }).filter(x => x.id === id)
   if (!list.length) return res.status(404).json({ ok: false })
   res.json({ reservation: list[0], logs: reservationLogs(id) })
+})
+
+// ---- 领队团队行程（入园 + 多设施打包） ----
+app.get('/api/groups', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listGroups({
+      status: q.status && q.status !== 'all' ? q.status : null,
+      day: q.day ? num(q.day) : null
+    }),
+    stats: groupStats()
+  })
+})
+
+app.get('/api/groups/:id', (req, res) => {
+  const d = groupDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '团队行程不存在' })
+  res.json(d)
+})
+
+// 领队提交行程（不占名额、不收款；运营确认时统一锁定）
+app.post('/api/groups', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, submitGroup({
+    leader_name: String(b.leader_name || ''),
+    leader_phone: String(b.leader_phone || ''),
+    org: String(b.org || ''),
+    headcount: num(b.headcount, 0),
+    deposit_rate: num(b.deposit_rate, 30),
+    legs: Array.isArray(b.legs) ? b.legs.map(l => ({
+      scope: l.scope === 'ride' ? 'ride' : 'entry',
+      slot_id: num(l.slot_id),
+      ride_id: num(l.ride_id)
+    })) : []
+  }, idemKey(req)), 201)
+})
+
+// 运营确认：统一锁定各时段名额 + 收取订金
+app.post('/api/groups/:id/confirm', (req, res) => {
+  reply(req, res, confirmGroup(num(req.params.id), idemKey(req)))
+})
+
+// 运营拒绝行程（待确认）
+app.post('/api/groups/:id/reject', (req, res) => {
+  reply(req, res, rejectGroup(num(req.params.id), String(req.body?.reason || ''), idemKey(req)))
+})
+
+// 分批核销（指定行程腿；默认入园腿），首次核销入园自动收齐尾款
+app.post('/api/groups/:id/checkin', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, checkinGroupLeg(num(req.params.id), {
+    legId: b.leg_id ? num(b.leg_id) : null,
+    qty: num(b.qty, 0),
+    requestId: idemKey(req)
+  }))
+})
+
+// 尾款结算（可预缴/补缴，不传金额=收齐全部尾款）
+app.post('/api/groups/:id/settle', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, settleGroupBalance(num(req.params.id), b.amount === undefined || b.amount === null ? null : num(b.amount), idemKey(req)))
+})
+
+// 部分退团（对未开始行程统一核减人数；提前全退/当日 50%）
+app.post('/api/groups/:id/refund', (req, res) => {
+  reply(req, res, partialRefund(num(req.params.id), num(req.body?.qty, 1), idemKey(req)))
+})
+
+// 整团取消
+app.post('/api/groups/:id/cancel', (req, res) => {
+  reply(req, res, cancelGroup(num(req.params.id), idemKey(req)))
+})
+
+// 手动改期行程腿（同设施其他时段，不加价）
+app.post('/api/groups/:id/legs/:legId/reroute', (req, res) => {
+  reply(req, res, rerouteGroupLeg(num(req.params.id), num(req.params.legId), num(req.body?.slot_id), idemKey(req)))
 })
 
 // ---- 游客会员与权益中心 ----
